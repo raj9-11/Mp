@@ -1,0 +1,171 @@
+name: mpv-android AC3+SPDIF (empty-repo end-to-end)
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "0 3 * * *"
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout this empty repo (patch host)
+        uses: actions/checkout@v4
+
+      - name: Set up JDK
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Install Android SDK / NDK
+        run: |
+          yes | sdkmanager --licenses
+          sdkmanager "platform-tools" "platforms;android-34" "build-tools;34.0.0" "ndk;26.3.11579264"
+
+      - name: Clone upstream mpv-android
+        run: |
+          git clone --depth=1 https://github.com/mpv-android/mpv-android.git
+          cd mpv-android
+          git submodule update --init --recursive || true
+
+      - name: Fetch native sources via buildscripts
+        working-directory: mpv-android/buildscripts
+        run: |
+          ./download.sh
+
+      - name: Locate mpv and ffmpeg source dirs
+        id: locate
+        working-directory: mpv-android/buildscripts
+        shell: bash
+        run: |
+          MPV_DIR=$(find . -maxdepth 3 -type d -name mpv | head -n1)
+          FFMPEG_DIR=$(find . -maxdepth 3 -type d -name ffmpeg | head -n1)
+          echo "mpv=$MPV_DIR" >> $GITHUB_OUTPUT
+          echo "ffmpeg=$FFMPEG_DIR" >> $GITHUB_OUTPUT
+
+      - name: Enable AC-3 encoders for FFmpeg (lavcac3enc needs them)
+        working-directory: mpv-android/buildscripts
+        shell: bash
+        run: |
+          FDIR="${{ steps.locate.outputs.ffmpeg }}"
+          # Append encoders to configure invocations at build time by dropping a marker script the buildscripts will source/execute.
+          # If your mpv-android revision uses different scripts, adjust this sed/find block accordingly.
+          CFGS=$(grep -RIl "configure .*--target-os=android" "$FDIR" ../ scripts . 2>/dev/null || true)
+          for f in $CFGS; do
+            sed -i 's#\./configure #./configure --enable-encoder=ac3 --enable-encoder=ac3_fixed #g' "$f" || true
+          done
+
+      - name: Add mpv.conf defaults (passthrough + AC-3 fallback)
+        run: |
+          mkdir -p mpv-android/app/src/main/assets
+          cat > mpv-android/app/src/main/assets/mpv.conf << 'EOF'
+          audio-spdif=ac3,dts
+          ad=spdif:ac3,spdif:dts
+          af=lavcac3enc=yes:640:3
+          EOF
+
+      - name: Add Java IEC61937 passthrough helper
+        run: |
+          mkdir -p mpv-android/app/src/main/java/is/xyz/mpv/audio
+          cat > mpv-android/app/src/main/java/is/xyz/mpv/audio/PassthroughAudioTrack.java << 'EOF'
+          package is.xyz.mpv.audio;
+          import android.media.AudioAttributes;
+          import android.media.AudioFormat;
+          import android.media.AudioManager;
+          import android.media.AudioTrack;
+          public class PassthroughAudioTrack {
+            private AudioTrack track;
+            public boolean openIec61937(int rate) {
+              AudioAttributes attrs = new AudioAttributes.Builder()
+                .setUsage(AudioAttributes.USAGE_MEDIA)
+                .setContentType(AudioAttributes.CONTENT_TYPE_MOVIE).build();
+              AudioFormat fmt = new AudioFormat.Builder()
+                .setEncoding(AudioFormat.ENCODING_IEC61937)
+                .setSampleRate(rate)
+                .setChannelMask(AudioFormat.CHANNEL_OUT_STEREO).build();
+              int buf = AudioTrack.getMinBufferSize(rate,
+                AudioFormat.CHANNEL_OUT_STEREO, AudioFormat.ENCODING_PCM_16BIT) * 4;
+              track = new AudioTrack(attrs, fmt, Math.max(buf, 32768),
+                AudioTrack.MODE_STREAM, AudioManager.AUDIO_SESSION_ID_GENERATE);
+              return track.getState() == AudioTrack.STATE_INITIALIZED;
+            }
+            public void play() { if (track != null) track.play(); }
+            public int writeShorts(short[] d, int ofs, int len) {
+              if (track == null) return 0;
+              return track.write(d, ofs, len, AudioTrack.WRITE_BLOCKING);
+            }
+            public void release() { if (track != null) track.release(); }
+          }
+          EOF
+
+      - name: Inject minimal AO (android_pt) into mpv tree
+        working-directory: mpv-android/buildscripts
+        shell: bash
+        run: |
+          MPV="${{ steps.locate.outputs.mpv }}"
+          mkdir -p "$MPV/audio/out"
+          cat > "$MPV/audio/out/ao_android_pt.c" << 'EOF'
+          #include "audio/out/ao.h"
+          #include "audio/format.h"
+          #include "osdep/android/jni.h"
+          struct priv { JNIEnv *env; jclass cls; jobject obj; jmethodID open, play, write, release; };
+          static int init(struct ao *ao){
+            struct priv *p=ao->priv=talloc_zero(ao,struct priv);
+            JNIEnv *e=jni_get_env();
+            p->env=e;
+            jclass cls=(*e)->FindClass(e,"is/xyz/mpv/audio/PassthroughAudioTrack");
+            p->cls=(*e)->NewGlobalRef(e,cls);
+            jmethodID ctor=(*e)->GetMethodID(e,p->cls,"<init>","()V");
+            p->obj=(*e)->NewGlobalRef(e,(*e)->NewObject(e,p->cls,ctor));
+            p->open=(*e)->GetMethodID(e,p->cls,"openIec61937","(I)Z");
+            p->play=(*e)->GetMethodID(e,p->cls,"play","()V");
+            p->write=(*e)->GetMethodID(e,p->cls,"writeShorts","([SII)I");
+            p->release=(*e)->GetMethodID(e,p->cls,"release","()V");
+            if (!((*e)->CallBooleanMethod(e,p->obj,p->open,(jint)ao->samplerate))) return -1;
+            (*e)->CallVoidMethod(e,p->obj,p->play);
+            return 0;
+          }
+          static void uninit(struct ao *ao){
+            struct priv *p=ao->priv; if(!p) return;
+            JNIEnv *e=p->env;
+            if(p->obj){ (*e)->CallVoidMethod(e,p->obj,p->release); (*e)->DeleteGlobalRef(e,p->obj); }
+            if(p->cls){ (*e)->DeleteGlobalRef(e,p->cls); }
+          }
+          static int write(struct ao *ao, void **data, int samples, int flags){
+            struct priv *p=ao->priv; JNIEnv *e=p->env; int n=samples*2;
+            jshortArray arr=(*e)->NewShortArray(e,n);
+            (*e)->SetShortArrayRegion(e,arr,0,n,(const jshort*)data);
+            int w=(*e)->CallIntMethod(e,p->obj,p->write,arr,0,n);
+            (*e)->DeleteLocalRef(e,arr);
+            return w<0?0:samples;
+          }
+          const struct ao_driver audio_out_android_pt={
+            .name="android_pt", .description="Android IEC61937 passthrough",
+            .init=init, .uninit=uninit, .write=write,
+            .priv_size=sizeof(struct priv),
+            .formats=(const int[]){AF_FORMAT_S_AC3,AF_FORMAT_S_DTS,0},
+            .channels=&(const struct ao_channels){2,2},
+            .samplerates=(const int[]){48000,0},
+          };
+          EOF
+          # Register AO in build (best-effort: append to wscript if present; adjust for meson if needed)
+          if [ -f "$MPV/wscript" ]; then
+            echo '## android_pt added by CI' >> "$MPV/wscript"
+          fi
+
+      - name: Build native (FFmpeg/libmpv) for arm64
+        working-directory: mpv-android/buildscripts
+        run: |
+          ./buildall.sh --arch arm64 mpv
+
+      - name: Build APK (release)
+        working-directory: mpv-android
+        run: ./gradlew assembleRelease
+
+      - name: Upload APK artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: mpv-ac3-spdif-apk
+          path: mpv-android/app/build/outputs/apk/**/release/*.apk
