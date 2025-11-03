@@ -7,14 +7,13 @@ on:
 jobs:
   build:
     runs-on: ubuntu-latest
-
     env:
       ANDROID_SDK_ROOT: ${{ github.workspace }}/android-sdk
       ANDROID_NDK_VERSION: 27.2.12479014
       API_LEVEL: 21
 
     steps:
-      - name: Checkout empty workspace
+      - name: Checkout
         uses: actions/checkout@v4
 
       - name: Set up Java 17
@@ -23,7 +22,7 @@ jobs:
           distribution: temurin
           java-version: '17'
 
-      - name: Set up Android SDK and NDK
+      - name: Setup Android SDK
         uses: android-actions/setup-android@v3
         with:
           packages: |
@@ -32,16 +31,17 @@ jobs:
             platform-tools
             ndk;27.2.12479014
 
-      - name: Install build deps
+      - name: Install build tools
         run: |
           sudo apt-get update
           sudo apt-get install -y git make cmake ninja-build autoconf automake libtool pkg-config yasm nasm perl
 
+      # ---------- Build OpenSSL (static) for Android ----------
       - name: Fetch OpenSSL (latest)
         run: |
           git clone --depth 1 https://github.com/openssl/openssl.git openssl
 
-      - name: Build OpenSSL for arm64-v8a
+      - name: Build OpenSSL (arm64-v8a)
         run: |
           export NDK="$ANDROID_SDK_ROOT/ndk/${ANDROID_NDK_VERSION}"
           export PATH="$NDK/toolchains/llvm/prebuilt/linux-x86_64/bin:$PATH"
@@ -51,7 +51,7 @@ jobs:
           make install_sw DESTDIR="$GITHUB_WORKSPACE/openssl-out-arm64" INSTALLTOP="/usr/local"
           make clean
 
-      - name: Build OpenSSL for armeabi-v7a
+      - name: Build OpenSSL (armeabi-v7a)
         run: |
           export NDK="$ANDROID_SDK_ROOT/ndk/${ANDROID_NDK_VERSION}"
           export PATH="$NDK/toolchains/llvm/prebuilt/linux-x86_64/bin:$PATH"
@@ -61,6 +61,323 @@ jobs:
           make install_sw DESTDIR="$GITHUB_WORKSPACE/openssl-out-armv7" INSTALLTOP="/usr/local"
           make clean
 
+      # ---------- Build FFmpeg (static) for Android with RTMPS ----------
+      - name: Fetch FFmpeg (official mirror)
+        run: |
+          git clone --depth 1 https://github.com/FFmpeg/FFmpeg.git ffmpeg
+
+      - name: Build FFmpeg (arm64-v8a)
+        run: |
+          set -eux
+          export NDK="$ANDROID_SDK_ROOT/ndk/${ANDROID_NDK_VERSION}"
+          export TOOLCHAIN="$NDK/toolchains/llvm/prebuilt/linux-x86_64"
+          export CC="$TOOLCHAIN/bin/aarch64-linux-android${API_LEVEL}-clang"
+          export CXX="$TOOLCHAIN/bin/aarch64-linux-android${API_LEVEL}-clang++"
+          export AR="$TOOLCHAIN/bin/llvm-ar"
+          export NM="$TOOLCHAIN/bin/llvm-nm"
+          export RANLIB="$TOOLCHAIN/bin/llvm-ranlib"
+          export STRIP="$TOOLCHAIN/bin/llvm-strip"
+          export OPENSSL_PREFIX="$GITHUB_WORKSPACE/openssl-out-arm64/usr/local"
+          cd ffmpeg
+          ./configure \
+            --target-os=android \
+            --arch=aarch64 \
+            --enable-cross-compile \
+            --cc="$CC" --cxx="$CXX" --ar="$AR" --nm="$NM" --ranlib="$RANLIB" --strip="$STRIP" \
+            --disable-shared --enable-static \
+            --disable-everything \
+            --enable-network \
+            --enable-protocol=rtmp \
+            --enable-protocol=rtmps \
+            --enable-protocol=tcp \
+            --enable-protocol=tls \
+            --enable-demuxer=rtsp \
+            --enable-muxer=flv \
+            --enable-parser=h264 \
+            --enable-parser=aac \
+            --enable-decoder=h264 \
+            --enable-decoder=aac \
+            --enable-decoder=pcm_alaw \
+            --enable-decoder=pcm_mulaw \
+            --enable-encoder=aac \
+            --enable-filter=aresample \
+            --enable-filter=asetpts \
+            --enable-filter=anull \
+            --enable-openssl \
+            --extra-cflags="-I${OPENSSL_PREFIX}/include" \
+            --extra-ldflags="-L${OPENSSL_PREFIX}/lib"
+          make -j$(nproc) ffmpeg
+          mkdir -p "$GITHUB_WORKSPACE/app/src/main/assets/ffmpeg/arm64-v8a"
+          cp -f ffmpeg "$GITHUB_WORKSPACE/app/src/main/assets/ffmpeg/arm64-v8a/ffmpeg"
+
+      - name: Build FFmpeg (armeabi-v7a)
+        run: |
+          set -eux
+          export NDK="$ANDROID_SDK_ROOT/ndk/${ANDROID_NDK_VERSION}"
+          export TOOLCHAIN="$NDK/toolchains/llvm/prebuilt/linux-x86_64"
+          export CC="$TOOLCHAIN/bin/armv7a-linux-androideabi${API_LEVEL}-clang"
+          export CXX="$TOOLCHAIN/bin/armv7a-linux-androideabi${API_LEVEL}-clang++"
+          export AR="$TOOLCHAIN/bin/llvm-ar"
+          export NM="$TOOLCHAIN/bin/llvm-nm"
+          export RANLIB="$TOOLCHAIN/bin/llvm-ranlib"
+          export STRIP="$TOOLCHAIN/bin/llvm-strip"
+          export OPENSSL_PREFIX="$GITHUB_WORKSPACE/openssl-out-armv7/usr/local"
+          cd ffmpeg
+          make distclean || true
+          ./configure \
+            --target-os=android \
+            --arch=arm \
+            --cpu=armv7-a \
+            --enable-cross-compile \
+            --cc="$CC" --cxx="$CXX" --ar="$AR" --nm="$NM" --ranlib="$RANLIB" --strip="$STRIP" \
+            --disable-shared --enable-static \
+            --disable-everything \
+            --enable-network \
+            --enable-protocol=rtmp \
+            --enable-protocol=rtmps \
+            --enable-protocol=tcp \
+            --enable-protocol=tls \
+            --enable-demuxer=rtsp \
+            --enable-muxer=flv \
+            --enable-parser=h264 \
+            --enable-parser=aac \
+            --enable-decoder=h264 \
+            --enable-decoder=aac \
+            --enable-decoder=pcm_alaw \
+            --enable-decoder=pcm_mulaw \
+            --enable-encoder=aac \
+            --enable-filter=aresample \
+            --enable-filter=asetpts \
+            --enable-filter=anull \
+            --enable-openssl \
+            --extra-cflags="-I${OPENSSL_PREFIX}/include" \
+            --extra-ldflags="-L${OPENSSL_PREFIX}/lib"
+          make -j$(nproc) ffmpeg
+          mkdir -p "$GITHUB_WORKSPACE/app/src/main/assets/ffmpeg/armeabi-v7a"
+          cp -f ffmpeg "$GITHUB_WORKSPACE/app/src/main/assets/ffmpeg/armeabi-v7a/ffmpeg"
+
+      # ---------- Create minimal Android app project (Java-only) ----------
+      - name: Create Android project files
+        run: |
+          set -eux
+          mkdir -p app/src/main/java/com/example/rtsp2yt
+          mkdir -p app/src/main/assets/ffmpeg
+          # settings.gradle with plugin management and repositories
+          cat > settings.gradle << 'EOF'
+          pluginManagement {
+            repositories {
+              gradlePluginPortal()
+              google()
+              mavenCentral()
+            }
+            plugins {
+              id("com.android.application") version "8.5.2"
+            }
+          }
+          dependencyResolutionManagement {
+            repositoriesMode.set(RepositoriesMode.FAIL_ON_PROJECT_REPOS)
+            repositories {
+              google()
+              mavenCentral()
+            }
+          }
+          rootProject.name = "RtspToYouTube"
+          include(":app")
+          EOF
+
+          # Root build.gradle to satisfy Gradle
+          cat > build.gradle << 'EOF'
+          // Root project build; module-level configuration is in app/build.gradle
+          EOF
+
+          # Module build.gradle (Java only)
+          cat > app/build.gradle << 'EOF'
+          plugins {
+            id 'com.android.application'
+          }
+          android {
+            namespace 'com.example.rtsp2yt'
+            compileSdk 34
+            defaultConfig {
+              applicationId "com.example.rtsp2yt"
+              minSdk 23
+              targetSdk 34
+              versionCode 1
+              versionName "1.0"
+            }
+            buildTypes {
+              release {
+                minifyEnabled false
+              }
+            }
+          }
+          dependencies {
+            implementation "androidx.appcompat:appcompat:1.7.0"
+            implementation "androidx.core:core:1.13.1"
+          }
+          EOF
+
+          # AndroidManifest with Foreground Service
+          cat > app/src/main/AndroidManifest.xml << 'EOF'
+          <manifest package="com.example.rtsp2yt" xmlns:android="http://schemas.android.com/apk/res/android">
+            <uses-permission android:name="android.permission.INTERNET"/>
+            <uses-permission android:name="android.permission.FOREGROUND_SERVICE"/>
+            <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MEDIA_PROCESSING"/>
+            <uses-permission android:name="android.permission.POST_NOTIFICATIONS"/>
+            <application android:allowBackup="false" android:label="RTSP→YouTube" android:usesCleartextTraffic="false">
+              <service
+                android:name=".StreamingService"
+                android:exported="false"
+                android:foregroundServiceType="mediaProcessing" />
+              <activity android:name=".MainActivity">
+                <intent-filter>
+                  <action android:name="android.intent.action.MAIN"/>
+                  <category android:name="android.intent.category.LAUNCHER"/>
+                </intent-filter>
+              </activity>
+            </application>
+          </manifest>
+          EOF
+
+          # Java helpers and activities
+          cat > app/src/main/java/com/example/rtsp2yt/FfmpegLoader.java << 'EOF'
+          package com.example.rtsp2yt;
+          import android.content.Context;
+          import android.os.Build;
+          import java.io.File;
+          import java.io.InputStream;
+          public class FfmpegLoader {
+            public static File ensureExecutable(Context ctx) throws Exception {
+              String abi = (Build.SUPPORTED_ABIS != null && Build.SUPPORTED_ABIS.length > 0)
+                ? Build.SUPPORTED_ABIS[0] : "arm64-v8a";
+              String assetPath = abi.contains("arm64") ? "ffmpeg/arm64-v8a/ffmpeg" : "ffmpeg/armeabi-v7a/ffmpeg";
+              File out = new File(ctx.getFilesDir(), "ffmpeg-" + abi.hashCode());
+              if (!out.exists()) {
+                try (InputStream in = ctx.getAssets().open(assetPath)) {
+                  java.nio.file.Files.copy(in, out.toPath());
+                }
+                Runtime.getRuntime().exec(new String[]{"chmod","0755", out.getAbsolutePath()}).waitFor();
+              }
+              return out;
+            }
+          }
+          EOF
+
+          cat > app/src/main/java/com/example/rtsp2yt/StreamingService.java << 'EOF'
+          package com.example.rtsp2yt;
+          import android.app.Notification;
+          import android.app.NotificationChannel;
+          import android.app.NotificationManager;
+          import android.app.Service;
+          import android.content.SharedPreferences;
+          import android.os.Build;
+          import android.os.IBinder;
+          import androidx.core.app.NotificationCompat;
+          public class StreamingService extends Service {
+            private volatile boolean running = false;
+            private Thread worker;
+            @Override public int onStartCommand(android.content.Intent i, int f, int id) {
+              startForeground(1, notification("Starting…"));
+              if (!running) {
+                running = true;
+                worker = new Thread(this::loopStream, "ffmpeg-loop");
+                worker.start();
+              }
+              return START_STICKY;
+            }
+            private void loopStream() {
+              try {
+                SharedPreferences p = getSharedPreferences("cfg", MODE_PRIVATE);
+                String rtsp = p.getString("rtsp", "");
+                String host = p.getString("host", "a.rtmps.youtube.com");
+                String key  = p.getString("key", "");
+                if (rtsp == null || rtsp.isEmpty() || key == null || key.isEmpty()) return;
+                String url = "rtmps://" + host + ":443/live2/" + key;
+                java.io.File ff = FfmpegLoader.ensureExecutable(this);
+                while (running) {
+                  Process proc = new ProcessBuilder(
+                    ff.getAbsolutePath(),
+                    "-rtsp_transport","tcp","-use_wallclock_as_timestamps","1",
+                    "-i", rtsp,
+                    "-c:v","copy",
+                    "-c:a","aac","-b:a","128k","-ar","44100","-ac","2",
+                    "-f","flv", url
+                  ).redirectErrorStream(true).start();
+                  // Stop just under 12 hours
+                  long stopAt = System.currentTimeMillis() + ((11L*3600 + 55L*60) * 1000L);
+                  while (System.currentTimeMillis() < stopAt && running) {
+                    if (!proc.isAlive()) break;
+                    try { Thread.sleep(1000); } catch (InterruptedException ignored) {}
+                  }
+                  if (proc.isAlive()) proc.destroy();
+                  try { proc.waitFor(); } catch (InterruptedException ignored) {}
+                  try { Thread.sleep(5000); } catch (InterruptedException ignored) {}
+                }
+              } catch (Exception ignored) { }
+            }
+            private Notification notification(String text) {
+              String chId = "stream";
+              NotificationManager nm = getSystemService(NotificationManager.class);
+              if (Build.VERSION.SDK_INT >= 26) {
+                nm.createNotificationChannel(new NotificationChannel(chId,"Streaming", NotificationManager.IMPORTANCE_LOW));
+              }
+              return new NotificationCompat.Builder(this, chId)
+                .setContentTitle("RTSP → YouTube")
+                .setContentText(text)
+                .setSmallIcon(android.R.drawable.stat_sys_upload)
+                .setOngoing(true)
+                .build();
+            }
+            @Override public IBinder onBind(android.content.Intent i){ return null; }
+            @Override public void onDestroy(){ running = false; if (worker != null) worker.interrupt(); }
+          }
+          EOF
+
+          cat > app/src/main/java/com/example/rtsp2yt/MainActivity.java << 'EOF'
+          package com.example.rtsp2yt;
+          import android.content.Intent;
+          import android.os.Bundle;
+          import android.widget.Button;
+          import android.widget.EditText;
+          import android.widget.LinearLayout;
+          import androidx.appcompat.app.AppCompatActivity;
+          import androidx.core.content.ContextCompat;
+          public class MainActivity extends AppCompatActivity {
+            @Override protected void onCreate(Bundle savedInstanceState) {
+              super.onCreate(savedInstanceState);
+              LinearLayout layout = new LinearLayout(this);
+              layout.setOrientation(LinearLayout.VERTICAL);
+              EditText rtsp = new EditText(this); rtsp.setHint("rtsp://user:pass@IP:554/stream1");
+              EditText host = new EditText(this); host.setHint("a.rtmps.youtube.com");
+              EditText key  = new EditText(this); key.setHint("YouTube stream key");
+              Button start = new Button(this); start.setText("Start");
+              Button stop  = new Button(this);  stop.setText("Stop");
+              layout.addView(rtsp); layout.addView(host); layout.addView(key); layout.addView(start); layout.addView(stop);
+              var p = getSharedPreferences("cfg", MODE_PRIVATE);
+              rtsp.setText(p.getString("rtsp",""));
+              host.setText(p.getString("host","a.rtmps.youtube.com"));
+              key.setText(p.getString("key",""));
+              Runnable save = () -> p.edit().putString("rtsp", rtsp.getText().toString())
+                .putString("host", host.getText().toString())
+                .putString("key",  key.getText().toString()).apply();
+              start.setOnClickListener(v -> { save.run(); ContextCompat.startForegroundService(this, new Intent(this, StreamingService.class)); });
+              stop.setOnClickListener(v -> stopService(new Intent(this, StreamingService.class)));
+              setContentView(layout);
+            }
+          }
+          EOF
+
+      - name: Build Debug APK
+        uses: gradle/gradle-build-action@v2
+        with:
+          gradle-version: 8.7
+          arguments: :app:assembleDebug
+
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: rtsp-to-youtube-apk
+          path: app/build/outputs/apk/debug/app-debug.apk
       - name: Fetch FFmpeg (official mirror)
         run: |
           git clone --depth 1 https://github.com/FFmpeg/FFmpeg.git ffmpeg
